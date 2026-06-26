@@ -54,7 +54,7 @@ Overall, PCA + LDA was selected as the recommended model because it provided the
 * Random Forest
 * Guided Regularized Random Forest (GRRF)
 * Feature Selection
-* Model Evaluation and Confusion Matrix
+* Model Evaluation and Confusion Matrices
 * R Programming
 
 ## Repository Contents
