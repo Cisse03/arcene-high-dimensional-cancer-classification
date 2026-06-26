@@ -1,0 +1,315 @@
+---
+title: "High-Dimensional Cancer Classification on the ARCENE Dataset"
+author: "Massogona Cisse"
+date: "2026-05-02"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: false
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 6,
+  fig.height = 4,
+  fig.align = "center"
+)
+
+library(foreign)
+library(MASS)
+library(randomForest)
+library(RRF)
+library(pROC)
+library(knitr)
+
+set.seed(20551088)
+```
+
+# 1. Introduction
+
+Mass spectrometry of patient sera has become a central tool in cancer screening research because it captures the relative abundance of thousands of protein fragments in a single assay. Profiles that distinguish cancerous from healthy tissue carry biological information about the disease state, and a classifier trained on those profiles offers the promise of an early, noninvasive screening rule. The ARCENE benchmark, released for the NIPS 2003 Feature Selection Challenge and distributed by the UCI Machine Learning Repository, encapsulates this problem in a 200-sample, 10,000-feature dataset that has become a standard testbed for high-dimensional cancer classification.
+
+The dataset embodies the high-dimensional regime in which the number of predictors greatly exceeds the number of observations, typically written as `p >> n`. In this regime classical multivariate methods break down. Ordinary least squares has infinitely many solutions, the within-class covariance matrix needed by linear discriminant analysis is singular, and any unregularized model with as many parameters as features will fit noise rather than signal. The methods designed for this regime fall into a few broad families. Regularization shrinks coefficients toward zero so the model has effectively fewer parameters. Dimension reduction projects the data onto a low-dimensional subspace before fitting. Embedded feature selection identifies a small subset of predictors with predictive value and discards the rest. Our analysis evaluates methods drawn from each of these families.
+
+Our research question is which of these approaches gives the most accurate and interpretable classification of cancer versus normal samples on ARCENE. We compare five methods: principal component analysis followed by logistic regression, principal component analysis followed by linear discriminant analysis, bagging, a random forest with variable importance, and a guided regularized random forest. Because a missed cancer diagnosis carries greater clinical cost than a false alarm, we prioritize sensitivity (the fraction of true cancer cases correctly identified) when ranking the methods, while still reporting specificity and overall error to characterize the full performance profile.
+
+# 2. Methodology
+
+## 2.1 Data Description and Preprocessing
+
+ARCENE, originally released for the NIPS 2003 Feature Selection Challenge and distributed by the UCI Machine Learning Repository, consists of 200 patient samples described by 10,000 continuous mass-spectrometry features and a binary response labeling each sample as cancer or normal. Roughly 3,000 of the predictors are deliberately included noise probes with no predictive power, which makes ARCENE a standard benchmark for high-dimensional feature selection. The class distribution (112 normal, 88 cancer) is moderately imbalanced but not extreme. We partition the data into an 80% training set of 160 observations and a 20% test set of 40 observations using a fixed random seed, and we drop columns with zero variance on the training matrix; the same columns are removed from the test matrix to keep the feature space aligned across the two sets.
+
+```{r data-load, echo = FALSE, results = 'hide'}
+arcene <- read.arff("arcene_data.arff")
+arcene$Class <- ifelse(arcene$Class == 2, 0, 1)
+arcene$Class <- as.factor(arcene$Class)
+
+set.seed(20551088)
+train_idx <- as.integer(sample(nrow(arcene), size = 0.8 * nrow(arcene)))
+
+x.train <- arcene[train_idx, -ncol(arcene)]
+y.train <- arcene$Class[train_idx]
+x.test  <- arcene[-train_idx, -ncol(arcene)]
+y.test  <- arcene$Class[-train_idx]
+
+keep <- apply(x.train, 2, sd) > 0
+x.train <- x.train[, keep]
+x.test  <- x.test[, keep]
+```
+
+## 2.2 Dimensionality Reduction (PCA)
+
+Principal component analysis serves two purposes in our pipeline. First, it provides a low-dimensional view of the predictor space useful for visualization. Second, it is a necessary preprocessing step for linear discriminant analysis, which requires an invertible within-class covariance matrix; with `p > n` that matrix is singular on the raw predictors but becomes well-defined after projection onto a small enough set of leading components. We fit PCA on the standardized training matrix and project the test matrix onto the same components, so the test set never participates in the rotation. The number of components retained for downstream classifiers is fixed in advance by a non-test criterion: 20 components for the logistic regression step, chosen from inspection of the variance spectrum, and the smallest count needed to capture 95% of training variance for LDA. We report the resulting LDA component count in Section 3.1.
+
+## 2.3 Classification Methods
+
+**PCA + Logistic Regression.** 
+Our first method reduces the predictor space to a small number of orthogonal directions of maximum variance, then fits a standard logistic regression in the reduced coordinates. The first stage uses principal component analysis on the training matrix; the second stage fits a binomial generalized linear model on the leading 20 components. PCA decouples the dimension reduction from the classification, and the choice of 20 components is fixed in advance from inspection of the variance spectrum rather than tuned against test accuracy.
+
+**PCA + Linear Discriminant Analysis.** 
+Linear discriminant analysis assumes that the two classes share a common covariance matrix and finds the linear combination of predictors that maximizes between-class separation relative to within-class spread. The shared-covariance assumption acts as a strong form of regularization at small sample sizes because it pools second-moment information across classes. Quadratic discriminant analysis, which would estimate a separate covariance matrix per class, doubles the number of covariance parameters and is unstable at our sample size, so we do not include it. We fit LDA on the principal components needed to capture 95% of training variance, with the resulting component count reported in Section 3.1.
+
+**Bagging.** 
+Bagging fits many decision trees on bootstrap resamples of the training data and aggregates their class votes by majority. The mechanism that drives the improvement over a single tree is variance reduction: averaging an ensemble of noisy but approximately unbiased predictors yields a more stable predictor than any single member. We implement bagging via the `randomForest` package with `mtry` set to the total number of predictors, so every split considers all available features and the procedure reduces to bagging in the textbook sense.
+
+**Random Forest with Variable Importance.**
+A random forest extends bagging by drawing a fresh random subset of predictors at each split, which decorrelates the trees and reduces ensemble variance further than bagging alone. Setting `importance = TRUE` in the fit produces two per-feature importance scores: the mean decrease in classification accuracy when a feature is randomly permuted across out-of-bag samples, and the mean decrease in node impurity (Gini) attributable to splits on that feature. These scores serve both as an interpretive output describing which features drive the classifier and as input to the GRRF step that follows.
+
+**Guided Regularized Random Forest (GRRF).** GRRF, introduced by Deng and Runger (2013), modifies the random forest splitting rule so that splits on features with low prior importance are penalized. The procedure first fits an unregularized regularized random forest (RRF) to obtain initial importance scores, then fits a guided RRF whose per-feature regularization coefficient is `coef_j = (1 - gamma) + gamma * (importance_j / max(importance))`, where larger gamma penalizes low-importance features more aggressively. We fix gamma at 0.5, the midpoint recommended by Deng and Runger, before running any model on the test set; the resulting selected feature set is reported as a candidate biomarker shortlist.
+
+## 2.4 Model Evaluation
+
+We evaluate every model on the held-out 20% test set, with Class 1 (cancer) as the positive class. From each model's confusion matrix we compute three metrics: sensitivity, defined as `TP / (TP + FN)`, the fraction of true cancer cases the model correctly identifies; specificity, defined as `TN / (TN + FP)`, the fraction of true normal cases the model correctly classifies; and the overall test error rate, defined as `(FP + FN) / N`. We rank methods primarily by sensitivity because a false negative, a cancer patient classified as normal, carries materially greater clinical cost than a false positive, which typically only triggers a confirmatory test. For the LDA model we additionally report the area under the receiver operating characteristic curve (AUC), which is the probability that a randomly chosen cancer sample receives a higher predicted posterior than a randomly chosen normal sample, and which summarizes classifier performance across all decision thresholds.
+
+```{r eval-fn, echo = FALSE}
+model.stat <- data.frame(
+  model = character(),
+  Sensitivity = numeric(),
+  Specificity = numeric(),
+  Error = numeric(),
+  stringsAsFactors = FALSE
+)
+
+testAccuracy <- function(prediction, model.name) {
+  truth.table <- table(
+    Prediction = factor(prediction, levels = c("0", "1")),
+    Actual     = factor(y.test,     levels = c("0", "1"))
+  )
+
+  TP <- truth.table["1", "1"]
+  TN <- truth.table["0", "0"]
+  FP <- truth.table["1", "0"]
+  FN <- truth.table["0", "1"]
+
+  sensitivity <- TP / (TP + FN)
+  specificity <- TN / (TN + FP)
+  error       <- (FP + FN) / sum(truth.table)
+
+  model.stat[nrow(model.stat) + 1, ] <<- list(
+    model = model.name,
+    Sensitivity = sensitivity,
+    Specificity = specificity,
+    Error = error
+  )
+
+  list(
+    confusion = truth.table,
+    sensitivity = sensitivity,
+    specificity = specificity,
+    error = error
+  )
+}
+```
+
+# 3. Results
+
+## 3.1 Data Summary and PCA
+
+```{r pca-fit}
+set.seed(20551088)
+pca.fit <- prcomp(x.train, scale. = TRUE)
+cum.var <- cumsum(pca.fit$sdev^2) / sum(pca.fit$sdev^2)
+n.comp.95 <- which(cum.var >= 0.95)[1]
+```
+
+```{r pca-scree, fig.cap = "Scree plot of the first 50 principal components on the training data."}
+plot(pca.fit$sdev[1:50]^2, type = "b", pch = 19, cex = 0.6,
+     xlab = "Component", ylab = "Variance",
+     main = "Scree Plot")
+```
+
+```{r pca-cumvar, fig.cap = "Cumulative proportion of variance explained, with 80%, 90%, and 95% thresholds marked."}
+plot(cum.var[1:140], type = "l", lwd = 2,
+     xlab = "Number of Components", ylab = "Cumulative Variance Explained",
+     main = "Cumulative Variance Explained")
+abline(h = c(0.80, 0.90, 0.95), col = c("blue", "orange", "red"), lty = 2)
+legend("bottomright", legend = c("80%", "90%", "95%"),
+       col = c("blue", "orange", "red"), lty = 2, cex = 0.8)
+```
+
+```{r pca-scatter, fig.cap = "Training observations projected onto the first two principal components, colored by class."}
+plot(pca.fit$x[, 1], pca.fit$x[, 2],
+     col = c("steelblue", "tomato")[as.numeric(y.train)],
+     pch = 19,
+     xlab = "PC1", ylab = "PC2",
+     main = "Training Data: PC1 vs PC2")
+legend("topright", legend = c("Normal (0)", "Cancer (1)"),
+       col = c("steelblue", "tomato"), pch = 19)
+```
+
+Principal component analysis on the training matrix spreads the variance across many components, which is the expected pattern for mass-spectrometry profiles where many features carry small fractions of the total signal. We need `r which(cum.var >= 0.80)[1]` components to reach 80% of the variance, `r which(cum.var >= 0.90)[1]` for 90%, and `r n.comp.95` for 95%. The scatter of training observations in the PC1, PC2 plane shows visible but incomplete class separation; the two leading components capture some of the cancer-versus-normal contrast, but the substantial overlap confirms that classification will require many more components or, alternatively, methods that operate in the original feature space.
+
+## 3.2 Individual Model Results
+
+### 3.2.1 PCA + Logistic Regression
+
+```{r pca-lr}
+train.pca20 <- data.frame(pca.fit$x[, 1:20], Class = y.train)
+test.pca20  <- data.frame(predict(pca.fit, x.test)[, 1:20])
+
+set.seed(20551088)
+fit.glm <- glm(Class ~ ., data = train.pca20, family = binomial)
+prob.glm <- predict(fit.glm, newdata = test.pca20, type = "response")
+pred.glm <- factor(ifelse(prob.glm > 0.5, "1", "0"), levels = c("0", "1"))
+
+m.glm <- testAccuracy(pred.glm, "PCA + Logistic Regression")
+kable(m.glm$confusion,
+      caption = "Confusion matrix for PCA + Logistic Regression on the test set.")
+```
+
+On the test set, PCA + logistic regression with 20 components achieves sensitivity `r sprintf("%.3f", m.glm$sensitivity)`, specificity `r sprintf("%.3f", m.glm$specificity)`, and an overall error rate of `r sprintf("%.3f", m.glm$error)`. The model recovers most cancer cases but commits a non-negligible number of false positives, which reflects the limited information carried by the leading 20 components when the cancer signal is spread across many predictors. The result establishes a competitive linear baseline against which the more flexible methods below are measured.
+
+### 3.2.2 PCA + LDA
+
+```{r pca-lda}
+train.pca95 <- data.frame(pca.fit$x[, 1:n.comp.95], Class = y.train)
+test.pca95  <- data.frame(predict(pca.fit, x.test)[, 1:n.comp.95])
+
+fit.lda <- lda(Class ~ ., data = train.pca95)
+pred.lda <- predict(fit.lda, test.pca95)
+
+m.lda <- testAccuracy(pred.lda$class, "PCA + LDA")
+kable(m.lda$confusion,
+      caption = "Confusion matrix for PCA + LDA on the test set.")
+```
+
+On the test set, PCA + LDA with `r n.comp.95` components achieves sensitivity `r sprintf("%.3f", m.lda$sensitivity)`, specificity `r sprintf("%.3f", m.lda$specificity)`, and an overall error rate of `r sprintf("%.3f", m.lda$error)`. Every cancer case in the test split is correctly identified, and the misclassifications all fall on the normal side. The shared-covariance assumption pays off here: with `r n.comp.95` LDA coefficients to estimate from 160 training observations, pooling the within-class second moments into a single matrix produces a more stable discriminant direction than a class-specific estimator could.
+
+```{r lda-ld1, fig.cap = "Distribution of LDA discriminant scores (LD1) by class on the training data."}
+lda.train.scores <- predict(fit.lda, train.pca95)$x[, 1]
+
+hist(lda.train.scores[y.train == "0"],
+     col = rgb(0.27, 0.51, 0.71, 0.5),
+     xlim = range(lda.train.scores), breaks = 15,
+     main = "LDA Discriminant Scores by Class", xlab = "LD1")
+hist(lda.train.scores[y.train == "1"],
+     col = rgb(1, 0.39, 0.28, 0.5), breaks = 15, add = TRUE)
+legend("topright", legend = c("Normal (0)", "Cancer (1)"),
+       fill = c(rgb(0.27, 0.51, 0.71, 0.5), rgb(1, 0.39, 0.28, 0.5)))
+```
+
+The training distribution of LDA discriminant scores along LD1 is nearly disjoint between the two classes, with the cancer mode pushed substantially above the normal mode. The visual separation is consistent with the perfect test-set sensitivity (`r sprintf("%.3f", m.lda$sensitivity)`) reported above and confirms that LD1 carries most of the classification-relevant signal in the principal-component subspace.
+
+```{r lda-roc, fig.cap = "ROC curve for PCA + LDA on the test set."}
+lda.post <- predict(fit.lda, test.pca95)$posterior[, "1"]
+roc.lda <- roc(y.test, lda.post, levels = c("0", "1"), direction = "<")
+
+plot(roc.lda, col = "blue", lwd = 2,
+     main = paste0("PCA + LDA ROC (AUC = ", round(auc(roc.lda), 3), ")"))
+```
+
+The ROC curve plots sensitivity against 1 - specificity as the classification threshold sweeps from 0 to 1. Our PCA + LDA model achieves an AUC of `r sprintf("%.3f", as.numeric(auc(roc.lda)))`, indicating near-perfect rank ordering of the test cases by predicted cancer probability.
+
+### 3.2.3 Bagging
+
+```{r bagging, fig.cap = "OOB error rate vs. number of trees for the bagging ensemble."}
+set.seed(20551088)
+fit.bag <- randomForest(x.train, y.train, mtry = ncol(x.train))
+plot(fit.bag, main = "Bagging OOB Error")
+
+pred.bag <- predict(fit.bag, x.test)
+m.bag <- testAccuracy(pred.bag, "Bagging")
+kable(m.bag$confusion,
+      caption = "Confusion matrix for bagging on the test set.")
+```
+
+On the test set, bagging achieves sensitivity `r sprintf("%.3f", m.bag$sensitivity)`, specificity `r sprintf("%.3f", m.bag$specificity)`, and error `r sprintf("%.3f", m.bag$error)`. The lower sensitivity relative to PCA + LDA reflects the difficulty trees face on this dataset: each split must choose a feature from `r ncol(x.train)` noisy candidates, and bootstrap resampling alone is not enough to suppress the resulting per-tree variance even after averaging the ensemble. The OOB error curve flattens within roughly 100 to 200 trees and remains stable through the default 500-tree ensemble, which confirms that the ensemble has converged and that adding more trees would not improve performance.
+
+### 3.2.4 Random Forest with Variable Importance
+
+```{r rf, fig.cap = "OOB error rate vs. number of trees for the random forest."}
+set.seed(20551088)
+fit.rf <- randomForest(x.train, y.train, importance = TRUE)
+plot(fit.rf, main = "Random Forest OOB Error")
+
+pred.rf <- predict(fit.rf, x.test)
+m.rf <- testAccuracy(pred.rf, "Random Forest")
+kable(m.rf$confusion,
+      caption = "Confusion matrix for the random forest on the test set.")
+```
+
+```{r rf-varimp, fig.cap = "Random forest variable importance: top 30 features by mean decrease in accuracy and mean decrease in Gini.", fig.height = 6}
+randomForest::varImpPlot(fit.rf, n.var = 30, main = "Random Forest Variable Importance")
+```
+
+On the test set, the random forest achieves sensitivity `r sprintf("%.3f", m.rf$sensitivity)`, specificity `r sprintf("%.3f", m.rf$specificity)`, and error `r sprintf("%.3f", m.rf$error)`. The decorrelation produced by sampling a random subset of predictors at each split improves the ensemble over bagging on every metric, although it still trails PCA + LDA. The OOB error curve stabilizes within the default 500-tree budget, which indicates ensemble convergence. The variable importance plot identifies a small subset of high-scoring predictors on both the mean-decrease-in-accuracy and mean-decrease-in-Gini scales, consistent with the noise-probe structure of ARCENE and motivating the explicit feature-selection step in Section 3.2.5.
+
+### 3.2.5 Guided Regularized Random Forest (GRRF)
+
+```{r grrf}
+set.seed(20551088)
+fit.rrf <- RRF(x.train, y.train, flagReg = 0)
+importance.rrf <- fit.rrf$importance[, 1]
+
+gamma <- 0.5
+coefGRRF <- (1 - gamma) + gamma * (importance.rrf / max(importance.rrf))
+
+set.seed(20551088)
+fit.grrf <- RRF(x.train, y.train, flagReg = 1, coefReg = coefGRRF)
+selected.features <- fit.grrf$feaSet
+n.selected <- length(selected.features)
+
+pred.grrf <- predict(fit.grrf, x.test)
+m.grrf <- testAccuracy(pred.grrf, "GRRF")
+kable(m.grrf$confusion,
+      caption = "Confusion matrix for GRRF on the test set.")
+```
+
+On the test set, GRRF reduces the active feature set from `r ncol(x.train)` candidates to `r n.selected` and achieves sensitivity `r sprintf("%.3f", m.grrf$sensitivity)`, specificity `r sprintf("%.3f", m.grrf$specificity)`, and error `r sprintf("%.3f", m.grrf$error)`. The classifier identifies every cancer case in the test split but accepts a higher false-positive rate than PCA + LDA in exchange for the dramatic reduction in feature count. The compact selected set is the practical contribution of GRRF on this dataset: it produces a candidate biomarker shortlist that is small enough for follow-up biological validation in a wet-lab setting, where validating `r ncol(x.train)` features would be infeasible but validating `r n.selected` is routine.
+
+## 3.3 Model Comparison
+
+```{r compare-table, echo = FALSE}
+kable(model.stat, digits = 3,
+      caption = "Test-set performance of all five classification methods.")
+```
+
+```{r compare-plot, fig.cap = "Sensitivity, specificity, and error rate of all five methods on the test set."}
+m.matrix <- as.matrix(model.stat[, c("Sensitivity", "Specificity", "Error")])
+rownames(m.matrix) <- c("PCA+LR", "PCA+LDA", "Bagging", "RF", "GRRF")
+
+barplot(t(m.matrix), beside = TRUE,
+        col = c("steelblue", "tomato", "gold"),
+        ylim = c(0, 1.25),
+        main = "Test-Set Performance by Method",
+        ylab = "Rate")
+legend("top", legend = c("Sensitivity", "Specificity", "Error"),
+       fill = c("steelblue", "tomato", "gold"),
+       horiz = TRUE, bty = "n", cex = 0.9)
+```
+
+Across the five methods, PCA + LDA is best on every metric in our test split. It ties GRRF for the highest sensitivity at `r sprintf("%.3f", max(model.stat$Sensitivity))`, achieves the highest specificity at `r sprintf("%.3f", max(model.stat$Specificity))`, and posts the lowest overall error at `r sprintf("%.3f", min(model.stat$Error))`. GRRF matches PCA + LDA on sensitivity but trails it on specificity (`r sprintf("%.3f", m.grrf$specificity)`), so its overall error is higher despite the perfect cancer recall. PCA + logistic regression and the random forest produce identical test-set metrics in this run, with sensitivity `r sprintf("%.3f", m.glm$sensitivity)`, specificity `r sprintf("%.3f", m.glm$specificity)`, and error `r sprintf("%.3f", m.glm$error)`, each missing one cancer case. Bagging is the weakest of the five with sensitivity `r sprintf("%.3f", m.bag$sensitivity)`, the lowest in the table, and it is the only result that would be unacceptable for a screening rule. We articulate the recommendation that follows from these numbers in the discussion below.
+
+# 4. Discussion
+
+PCA + LDA is the strongest classifier in our comparison. It achieves perfect test-set sensitivity (`r sprintf("%.3f", m.lda$sensitivity)`), the highest specificity of any method (`r sprintf("%.3f", m.lda$specificity)`), and the lowest overall error rate (`r sprintf("%.3f", m.lda$error)`), and it dominates the alternatives on the primary metric we set in advance. GRRF also reaches perfect sensitivity (`r sprintf("%.3f", m.grrf$sensitivity)`) but accepts a substantially lower specificity (`r sprintf("%.3f", m.grrf$specificity)`) in exchange for a much smaller selected feature set. PCA + logistic regression and the random forest land in the middle of the comparison with identical test-set metrics in this split, while bagging trails the other four. The pattern points to two qualitatively different strong solutions in the high-dimensional regime: a pooled-covariance discriminant analysis on a low-dimensional projection of the predictors, and an ensemble of trees with explicit feature selection.
+
+In a clinical screening context the metric that matters is sensitivity, because the cost of a missed cancer diagnosis dwarfs the cost of a false alarm that triggers a confirmatory test. By that criterion PCA + LDA is our primary recommendation: it correctly identifies every cancer case in the test set and does so with the highest specificity of any method that achieves perfect sensitivity. GRRF is positioned as a secondary tool with a different value proposition. Its `r n.selected`-feature shortlist (out of `r ncol(x.train)` candidates after zero-variance removal) is small enough for follow-up biological investigation in a laboratory setting, and the overlap between its selected features and the high-importance predictors flagged by the random forest can guide hypothesis generation about which protein abundances actually drive the cancer signal.
+
+Several limitations qualify these conclusions. The reported metrics come from a single 80/20 train/test split with only 13 cancer cases in the test set, which leaves substantial sampling uncertainty around every point estimate; a one-case change in the test split can move sensitivity by several percentage points. We did not cross-validate the comparison, so we cannot put confidence intervals on the differences between methods. The PCA preprocessing step is unsupervised, which means the leading components maximize total predictor variance rather than between-class separation, and a supervised dimension reduction such as partial least squares might give the LDA pipeline more discriminative directions for the same component budget. The GRRF results depend on both the gamma parameter and the random seed; we fixed gamma at 0.5 in advance from the Deng and Runger recommendation, but we did not characterize how the selected feature count or test metrics vary across other reasonable choices. Finally, the dataset includes roughly 3,000 intentional noise probes whose biological identity is undefined, so the variable-importance and GRRF feature lists describe predictive value within ARCENE but not necessarily biological relevance in a real proteomic assay.
+
+The natural next steps follow directly from the limitations above. Repeated stratified train/test splits or k-fold cross-validation would replace each point estimate in the comparison table with a sampling distribution and would let us put a confidence interval on the gap between PCA + LDA and the next best method. A supervised dimension reduction (partial least squares discriminant analysis is the obvious candidate) is worth comparing against PCA as the front end to LDA, because supervised projections often need fewer components for the same discriminative power. A stability analysis of the GRRF feature set across seeds and gamma values would reveal which of the `r n.selected` selected features are robustly chosen and which are artifacts of a single run. External validation on an independent cancer cohort, if one were available with comparable mass-spectrometry features, would test whether the LDA discriminant generalizes outside ARCENE. Any biomarker shortlist derived from these analyses, including the GRRF feature set, requires laboratory validation against an orthogonal measurement before it could inform clinical practice.
